@@ -11,13 +11,13 @@ from torchvision.utils import make_grid
 from tqdm import tqdm
 
 from config import (PATH_A, PATH_B, NUM_EPOCHS,
-                    SCALE, CYCLE_WEIGHT, WEIGHTS_DIR,
+                    SCALE, CYCLE_WEIGHT, WEIGHTS_DIR, GAN_CRIT,
                     RESUME_EPOCH, VISUALIZATION_FREQ, IDENTITY_WEIGHT,
                     CHECKPOINT_FREQ, EXP_NAME, NUM_RESBLOCKS)
 from criterion import PatchGanLoss
 from datasets import ImageDataset
 from models import ResnetGenerator, PatchDiscriminator
-from utils import to_var, to_tensor, to_image, AverageMeter
+from utils import to_var, to_tensor, to_image, AverageMeter, ImageHistory
 
 cudnn.benchmark = True
 
@@ -45,7 +45,7 @@ d_params = itertools.chain(discriminator_A.parameters(), discriminator_B.paramet
 g_optimizer = Adam(g_params, lr=2e-3)  # constant for 100 epochs, linear decay for 100 epochs
 d_optimizer = Adam(d_params, lr=1e-3)
 
-d_criterion = PatchGanLoss()
+d_criterion = PatchGanLoss(criterion=GAN_CRIT)
 cycle_criterion = nn.L1Loss()  # cycle loss is just L1 loss between original image and reconstructed image
 
 if IDENTITY_WEIGHT:
@@ -53,7 +53,7 @@ if IDENTITY_WEIGHT:
 
 if RESUME_EPOCH:
     generator_A2B.load_state_dict(torch.load(os.path.join(WEIGHTS_DIR, 'generator_A2B_{}.pkl'.format(RESUME_EPOCH))))
-    generator_B2A.load_state_dict(torch.load(os.path.join(WEIGHTS_DIR, 'geqnerator_B2A_{}.pkl'.format(RESUME_EPOCH))))
+    generator_B2A.load_state_dict(torch.load(os.path.join(WEIGHTS_DIR, 'generator_B2A_{}.pkl'.format(RESUME_EPOCH))))
     discriminator_A.load_state_dict(
         torch.load(os.path.join(WEIGHTS_DIR, 'discriminator_A_{}.pkl'.format(RESUME_EPOCH))))
     discriminator_B.load_state_dict(
@@ -63,6 +63,9 @@ if RESUME_EPOCH:
     d_optimizer.load_state_dict(torch.load(os.path.join(WEIGHTS_DIR, 'd_optimizer_{}.pkl'.format(RESUME_EPOCH))))
 
 num_batches = min(len(loader_A), len(loader_B))
+
+fake_A_history = ImageHistory(max_length=50)  # image buffers to improve discriminator stability
+fake_B_history = ImageHistory(max_length=50)
 
 for epoch in tqdm(range(NUM_EPOCHS), total=NUM_EPOCHS):
 
@@ -76,6 +79,7 @@ for epoch in tqdm(range(NUM_EPOCHS), total=NUM_EPOCHS):
     d_loss_meter = AverageMeter()
     g_loss_meter = AverageMeter()
     pbar = tqdm(range(num_batches), total=num_batches)
+
     for batch in pbar:
         img_A = next(iter(loader_A))
         img_B = next(iter(loader_B))
@@ -85,15 +89,21 @@ for epoch in tqdm(range(NUM_EPOCHS), total=NUM_EPOCHS):
         # TRAIN DISCRIMINATORS
         # loss for A discriminator
         fake_A = generator_B2A(img_B)
-        disc_A_batch = torch.cat([img_A, fake_A])
-        disc_A_targets = torch.Tensor([1, 0])  # manually create targets for discriminator
+        fake_A = fake_A.detach()  # detach generator output because we don't need generator gradients yet
+        fake_A_history.update(fake_A)  # update buffer of generated images
+        fake_A_old = fake_A_history.sample()
+        disc_A_batch = torch.cat([img_A, fake_A, fake_A_old])  # train with real, current fake, old fake
+        disc_A_targets = torch.Tensor([1, 0, 0])  # manually create targets for discriminator
         disc_A_score = discriminator_A(disc_A_batch)
         disc_A_loss = d_criterion(disc_A_score, disc_A_targets)
 
         # loss for zebra discriminator
         fake_B = generator_A2B(img_A)
-        disc_B_batch = torch.cat([img_B, fake_B])
-        disc_B_targets = torch.Tensor([1, 0])
+        fake_B = fake_B.detach()
+        fake_B_history.update(fake_B)
+        fake_B_old = fake_B_history.sample()
+        disc_B_batch = torch.cat([img_B, fake_B, fake_B_old])
+        disc_B_targets = torch.Tensor([1, 0, 0])
         disc_B_score = discriminator_B(disc_B_batch)
         disc_B_loss = d_criterion(disc_B_score, disc_B_targets)
 
@@ -118,7 +128,7 @@ for epoch in tqdm(range(NUM_EPOCHS), total=NUM_EPOCHS):
         disc_A_loss = d_criterion(disc_A_score, d_loss_target)
         cycle_loss_B = cycle_criterion(reconstructed_B, img_B)
 
-        # enforce color consistency between original and generated images
+        # enforce color consistency between original and generated images for non-color transforms
         identity_loss = 0
         if IDENTITY_WEIGHT:
             identity_loss_A = identity_criterion(fake_A, img_B) * IDENTITY_WEIGHT
@@ -135,14 +145,20 @@ for epoch in tqdm(range(NUM_EPOCHS), total=NUM_EPOCHS):
 
         pbar.set_description("[ d_loss: {:.4f} | g_loss: {:.4f} ]".format(d_loss_meter.avg, g_loss_meter.avg))
 
+        # CHECKPOINTS
+
         if (epoch + 1) % VISUALIZATION_FREQ == 0 and (batch + 1) == num_batches:
+            if not os.path.exists(os.path.join('outputs', EXP_NAME, 'ABA')):
+                os.makedirs(os.path.join('outputs', EXP_NAME, 'ABA'))
+
+            if not os.path.exists(os.path.join('outputs', EXP_NAME, 'BAB')):
+                os.makedirs(os.path.join('outputs', EXP_NAME, 'BAB'))
+
             img_A = to_tensor(img_A)
             fake_B = to_tensor(fake_B)
             reconstructed_A = to_tensor(reconstructed_A)
             cycle_ABA = make_grid(torch.cat([img_A, fake_B, reconstructed_A]), nrow=3)
             cycle_ABA = to_image(cycle_ABA)
-            if not os.path.exists(os.path.join('outputs', EXP_NAME, 'ABA')):
-                os.makedirs(os.path.join('outputs', EXP_NAME, 'ABA'))
             cycle_ABA.save(os.path.join('outputs', EXP_NAME, 'ABA', '{}.jpg'.format(current_epoch)))
 
             img_B = to_tensor(img_B)
@@ -150,13 +166,12 @@ for epoch in tqdm(range(NUM_EPOCHS), total=NUM_EPOCHS):
             reconstructed_B = to_tensor(reconstructed_B)
             cycle_BAB = make_grid(torch.cat([img_B, fake_A, reconstructed_B]), nrow=3)
             cycle_BAB = to_image(cycle_BAB)
-            if not os.path.exists(os.path.join('outputs', EXP_NAME, 'BAB')):
-                os.makedirs(os.path.join('outputs', EXP_NAME, 'BAB'))
-            cycle_ABA.save(os.path.join('outputs', EXP_NAME, 'BAB', '{}.jpg'.format(current_epoch)))
+            cycle_BAB.save(os.path.join('outputs', EXP_NAME, 'BAB', '{}.jpg'.format(current_epoch)))
 
     if (epoch + 1) % CHECKPOINT_FREQ == 0 or (epoch + 1) == NUM_EPOCHS:
         if not os.path.exists(WEIGHTS_DIR):
             os.makedirs(WEIGHTS_DIR)
+
         torch.save(generator_A2B.cpu().state_dict(),
                    os.path.join(WEIGHTS_DIR, 'generator_A2B_{}.pkl'.format(current_epoch)))
         torch.save(generator_B2A.cpu().state_dict(),

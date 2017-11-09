@@ -1,3 +1,5 @@
+import random
+
 import torch
 from torch.autograd import Variable
 from torchvision import transforms
@@ -31,7 +33,7 @@ def summary(net):
     print('Total number of parameters: %d' % num_params)
 
 
-class AverageMeter(object):
+class AverageMeter:
     """Computes and stores the average and current value"""
 
     def __init__(self):
@@ -57,3 +59,30 @@ def save_checkpoint(model_state, optimizer_state, filename):
     state = dict(model_state=model_state,
                  optimizer_state=optimizer_state)
     torch.save(state, filename)
+
+
+class ImageHistory:
+    def __init__(self, max_length=50):
+        self.max_length = max_length
+        self.length = 0
+        self.history = []
+
+    def update(self, image):
+        """
+        :param image:
+        :return:
+        """
+        if self.length < self.max_length:
+            self.history.append(image)
+            self.length += 1
+        else:
+            replace = random.randint(0, self.length-1)
+            self.history[replace] = image
+
+    def sample(self):
+        """
+        samples random image from buffer
+        :return:
+        """
+        image = random.choice(self.history)
+        return image
